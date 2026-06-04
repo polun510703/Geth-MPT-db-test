@@ -57,3 +57,14 @@ cmd/geth/geth
 cmd/rlpdump/rlpdump
 cmd/workload/workload
 cmd/keeper/keeper
+
+# CASTLE analysis outputs (large, do not commit)
+analysis/CASTLE/raOutput_*/
+analysis/CASTLE/observation/raOutput_*/
+analysis/CASTLE/observation/data/
+analysis/CASTLE/observation/__pycache__/
+analysis/CASTLE/observation/*.xlsx
+
+# Go installation tarball
+*.tar.gz
+go*.linux-amd64.tar.gz

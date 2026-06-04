@@ -1,0 +1,40 @@
+#!/usr/bin/env bpftrace
+// CASTLE: per-inode page-cache fill counter.
+//
+// Each mm_filemap_add_to_page_cache event represents a folio (kernel >=5.18)
+// of 2^order pages being installed into the page cache. With BadgerDB v4.9.1
+// the SST and vlog files are mmap'd, so disk reads surface here on page
+// faults. We sum the page count per (s_dev, i_ino) and the post-processor
+// joins inodes back to chaindata/*.sst and chaindata/*.vlog.
+//
+// Run with:
+//   sudo bpftrace -o <log> ebpf_pagecache_ino.bt
+// Send SIGINT to stop; END prints the @pages map.
+
+// Note: BEGIN/END trigger probes skipped — bpftrace v0.14 on kernel 6.8 fails
+// to resolve the BEGIN_trigger/END_trigger symbols (uprobe on /proc/self/exe).
+// On SIGINT bpftrace automatically dumps all maps before exiting, which is
+// exactly what we need. The shell wrapper records the start/end timestamps
+// via [OBS] markers + iostat for cross-referencing.
+//
+// $1 is the kernel-encoded dev_t for the chaindata filesystem (passed by
+// run_observation.sh). Filtering at the BPF level keeps the @pages map
+// small enough to stay under BPFTRACE_MAP_KEYS_MAX and avoids competing
+// for slots with irrelevant inodes (Go module cache, /tmp, etc.).
+
+// No in-BPF dev or inode filter. Rationale:
+//  1. chaindata lives on the same partition (nvme0n1p2) as /, /home, /usr,
+//     /tmp, accounts_*.bin and the test binary itself, so dev filtering
+//     gains little.
+//  2. More importantly, bpftrace v0.14 "promotes" any args->X referenced in
+//     a filter expression into the map key — adding /args->s_dev == X/
+//     silently turns @pages into a 2-tuple-key map, which complicates the
+//     parser AND inflates the key footprint.
+// We instead raise BPFTRACE_MAP_KEYS_MAX in the shell wrapper and reject
+// non-chaindata inodes post-hoc via inode_map.csv in the Python parser.
+
+tracepoint:filemap:mm_filemap_add_to_page_cache {
+    // Multi-page folio support: one event may install 2^order pages.
+    // On kernels without folios `order` is still 0, so this is safe.
+    @pages[args->i_ino] = sum((uint64)1 << args->order);
+}
