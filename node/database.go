@@ -21,6 +21,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb"
+	badgerdb "github.com/ethereum/go-ethereum/ethdb/badger"
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/log"
@@ -38,12 +39,13 @@ type DatabaseOptions struct {
 	MetricsNamespace string // the namespace for database relevant metrics
 	Cache            int    // the capacity(in megabytes) of the data caching
 	Handles          int    // number of files to be open simultaneously
-	ReadOnly         bool   // if true, no writes can be performed
+	ReadOnly             bool // if true, no writes can be performed
+	BadgerValueThreshold int  // BadgerDB KV separation threshold in bytes
 }
 
 type internalOpenOptions struct {
 	directory string
-	dbEngine  string // "leveldb" | "pebble"
+	dbEngine  string // "leveldb" | "pebble" | "badger"
 	DatabaseOptions
 }
 
@@ -79,7 +81,7 @@ func openDatabase(o internalOpenOptions) (ethdb.Database, error) {
 //	db is existent     |  from db         |  specified type (if compatible)
 func openKeyValueDatabase(o internalOpenOptions) (ethdb.KeyValueStore, error) {
 	// Reject any unsupported database type
-	if len(o.dbEngine) != 0 && o.dbEngine != rawdb.DBLeveldb && o.dbEngine != rawdb.DBPebble {
+	if len(o.dbEngine) != 0 && o.dbEngine != rawdb.DBLeveldb && o.dbEngine != rawdb.DBPebble && o.dbEngine != rawdb.DBBadger {
 		return nil, fmt.Errorf("unknown db.engine %v", o.dbEngine)
 	}
 	// Retrieve any pre-existing database's type and use that or the requested one
@@ -87,6 +89,10 @@ func openKeyValueDatabase(o internalOpenOptions) (ethdb.KeyValueStore, error) {
 	existingDb := rawdb.PreexistingDatabase(o.directory)
 	if len(existingDb) != 0 && len(o.dbEngine) != 0 && o.dbEngine != existingDb {
 		return nil, fmt.Errorf("db.engine choice was %v but found pre-existing %v database in specified data directory", o.dbEngine, existingDb)
+	}
+	if o.dbEngine == rawdb.DBBadger || existingDb == rawdb.DBBadger {
+		log.Info("Using badger as the backing database")
+		return newBadgerDBDatabase(o.directory, o.Cache, o.Handles, o.MetricsNamespace, o.ReadOnly, o.BadgerValueThreshold)
 	}
 	if o.dbEngine == rawdb.DBPebble || existingDb == rawdb.DBPebble {
 		log.Info("Using pebble as the backing database")
@@ -116,6 +122,16 @@ func newLevelDBDatabase(file string, cache int, handles int, namespace string, r
 // moving immutable chain segments into cold storage.
 func newPebbleDBDatabase(file string, cache int, handles int, namespace string, readonly bool) (ethdb.KeyValueStore, error) {
 	db, err := pebble.New(file, cache, handles, namespace, readonly)
+	if err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
+// newBadgerDBDatabase creates a persistent key-value database without a freezer
+// moving immutable chain segments into cold storage.
+func newBadgerDBDatabase(file string, cache int, handles int, namespace string, readonly bool, valueThreshold int) (ethdb.KeyValueStore, error) {
+	db, err := badgerdb.New(file, cache, handles, namespace, readonly, valueThreshold)
 	if err != nil {
 		return nil, err
 	}

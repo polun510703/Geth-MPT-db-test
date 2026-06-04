@@ -100,8 +100,14 @@ var (
 	}
 	DBEngineFlag = &cli.StringFlag{
 		Name:     "db.engine",
-		Usage:    "Backing database implementation to use ('pebble' or 'leveldb')",
+		Usage:    "Backing database implementation to use ('pebble', 'leveldb', or 'badger')",
 		Value:    node.DefaultConfig.DBEngine,
+		Category: flags.EthCategory,
+	}
+	BadgerValueThresholdFlag = &cli.IntFlag{
+		Name:     "db.badger.valuethreshold",
+		Usage:    "Value threshold in bytes for BadgerDB KV separation (values larger go to vlog)",
+		Value:    1024,
 		Category: flags.EthCategory,
 	}
 	AncientFlag = &flags.DirectoryFlag{
@@ -1061,6 +1067,7 @@ var (
 		EraFlag,
 		RemoteDBFlag,
 		DBEngineFlag,
+		BadgerValueThresholdFlag,
 		StateSchemeFlag,
 		HttpHeaderFlag,
 	}
@@ -1464,11 +1471,14 @@ func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 	}
 	if ctx.IsSet(DBEngineFlag.Name) {
 		dbEngine := ctx.String(DBEngineFlag.Name)
-		if dbEngine != "leveldb" && dbEngine != "pebble" {
-			Fatalf("Invalid choice for db.engine '%s', allowed 'leveldb' or 'pebble'", dbEngine)
+		if dbEngine != "leveldb" && dbEngine != "pebble" && dbEngine != "badger" {
+			Fatalf("Invalid choice for db.engine '%s', allowed 'leveldb', 'pebble', or 'badger'", dbEngine)
 		}
 		log.Info(fmt.Sprintf("Using %s as db engine", dbEngine))
 		cfg.DBEngine = dbEngine
+	}
+	if ctx.IsSet(BadgerValueThresholdFlag.Name) {
+		cfg.BadgerValueThreshold = ctx.Int(BadgerValueThresholdFlag.Name)
 	}
 	// deprecation notice for log debug flags (TODO: find a more appropriate place to put these?)
 	if ctx.IsSet(LogBacktraceAtFlag.Name) {

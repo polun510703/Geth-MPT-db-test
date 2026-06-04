@@ -2,9 +2,10 @@
 # run_analysis.sh — Run RA analysis + trie node stats plotting + execute stats plotting
 #
 # Usage:
-#   ./run_analysis.sh                        # analyze latest files
-#   ./run_analysis.sh 11350800_11351000      # analyze a specific block range
-#   ./run_analysis.sh 11350800_11351000 1000  # with bucket_size=1000 for plots
+#   ./run_analysis.sh                              # analyze latest files
+#   ./run_analysis.sh 11350800_11351000            # analyze a specific block range
+#   ./run_analysis.sh 11350800_11351000 1000       # with bucket_size=1000 for plots
+#   ./run_analysis.sh "" "" kvsep                  # with mode suffix for output dir
 
 set -e
 
@@ -13,10 +14,11 @@ ANALYSIS_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ANALYSIS_DIR"
 
 BLOCK_RANGE="$1"
+MODE_SUFFIX="$3"
 # ── Bucket size for execute stats plots ─────────────────────────────────────
 # Set DEFAULT_BUCKET_SIZE to a fixed value (e.g., 1000) or leave as "auto".
 # Command-line $2 overrides this default.
-DEFAULT_BUCKET_SIZE="1000"
+DEFAULT_BUCKET_SIZE="500"
 BUCKET_SIZE="${2:-$DEFAULT_BUCKET_SIZE}"
 if [ "$BUCKET_SIZE" = "auto" ]; then
   BUCKET_SIZE=""
@@ -57,7 +59,11 @@ elif [ -n "$TRIE_FILE" ]; then
 elif [ -n "$EXEC_STATS_FILE" ]; then
   RANGE=$(basename "$EXEC_STATS_FILE" | sed 's/^execute_stats_\([0-9]*_[0-9]*\).*/\1/')
 fi
-OUTPUT_DIR="./raOutput_${RANGE}"
+if [ -n "$MODE_SUFFIX" ]; then
+  OUTPUT_DIR="./raOutput_${RANGE}_${MODE_SUFFIX}"
+else
+  OUTPUT_DIR="./raOutput_${RANGE}"
+fi
 
 echo "Output directory: $OUTPUT_DIR"
 echo ""
@@ -113,6 +119,23 @@ if [ -n "$EXEC_STATS_FILE" ]; then
   echo ""
 else
   echo "[3/3] Skipping execute stats: no execute_stats file found."
+fi
+
+# ── 4. BadgerDB metrics: copy CSV ───────────────────────────────────────────
+BADGER_FILE=$(find_file "badger_metrics")
+if [ -n "$BADGER_FILE" ]; then
+  BADGER_DIR="$OUTPUT_DIR/badger_metrics"
+  mkdir -p "$BADGER_DIR"
+  echo "══════════════════════════════════════════════════════"
+  echo "[4/4] BadgerDB Metrics"
+  echo "  Input:  $BADGER_FILE"
+  echo "  Output: $BADGER_DIR"
+  echo "══════════════════════════════════════════════════════"
+  cp "$BADGER_FILE" "$BADGER_DIR/"
+  echo "  Copied: $(basename "$BADGER_FILE")"
+  echo ""
+else
+  echo "[4/4] Skipping BadgerDB metrics: no badger_metrics file found."
 fi
 
 echo "[done] Results in: $OUTPUT_DIR"

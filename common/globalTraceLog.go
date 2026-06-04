@@ -2,11 +2,14 @@ package common
 
 import (
 	"bytes"
+	"expvar"
 	"fmt"
 	syslog "log"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -15,9 +18,9 @@ import (
 // Tino: global logger for trace collection
 var gethLogger *syslog.Logger
 var logFile *os.File
-var targetStartBlockNumber uint64 = 1001 // The start block number for trace collection
-var targetEndBlockNumber uint64 = 10000  // The end block number for trace collection
-var shouldGlobalLogInUse bool = false   // Flag to enable or disable global logging, it will be set to true when the target start block number is reached
+var targetStartBlockNumber uint64 = 4000000 // The start block number for trace collection
+var targetEndBlockNumber uint64 = 4000002   // The end block number for trace collection
+var shouldGlobalLogInUse bool = false       // Flag to enable or disable global logging, it will be set to true when the target start block number is reached
 
 var logIsInitiated bool = false
 
@@ -213,7 +216,151 @@ func FlushExecuteStats(blockID string,
 	)
 }
 
+// CASTLE: badgerMetricCategory classifies a BadgerDB expvar key into a
+// category. Rules are checked in order — first match wins — so that
+// sub-categories (e.g. write_bytes_compaction) are caught before their
+// generic parent (write).
+func badgerMetricCategory(key string) string {
+	switch {
+	case key == "badger_write_bytes_compaction" || strings.HasPrefix(key, "badger_compaction_"):
+		return "compaction"
+	case key == "badger_hit_num_lsm_bloom_filter":
+		return "bloom_filter"
+	case key == "badger_write_pending_num_memtable":
+		return "memtable"
+	case strings.HasPrefix(key, "badger_iterator_"):
+		return "iterator"
+	case strings.HasPrefix(key, "badger_size_bytes_"):
+		return "size"
+	case strings.HasPrefix(key, "badger_get_"), strings.HasPrefix(key, "badger_read_"):
+		return "read"
+	case strings.HasPrefix(key, "badger_put_"), strings.HasPrefix(key, "badger_write_"):
+		return "write"
+	default:
+		return "other"
+	}
+}
+
+// CASTLE: SnapshotBadgerMetrics returns the current value of every badger_*
+// expvar as an int64 map. Map-typed counters (e.g. badger_get_num_lsm whose
+// value is an expvar.Map of per-level counters) are flattened to
+// "<name>.<sub>" entries. Sub-values that are not *expvar.Int are skipped
+// (badger uses *expvar.Int throughout, so this loses nothing in practice).
+// Snapshot the map before and after a measurement window and subtract to get
+// the delta attributable to that window.
+func SnapshotBadgerMetrics() map[string]int64 {
+	out := make(map[string]int64)
+	expvar.Do(func(kv expvar.KeyValue) {
+		if !strings.HasPrefix(kv.Key, "badger_") {
+			return
+		}
+		switch v := kv.Value.(type) {
+		case *expvar.Int:
+			out[kv.Key] = v.Value()
+		case *expvar.Map:
+			v.Do(func(sub expvar.KeyValue) {
+				if iv, ok := sub.Value.(*expvar.Int); ok {
+					out[kv.Key+"."+sub.Key] = iv.Value()
+				}
+			})
+		}
+	})
+	return out
+}
+
+// CASTLE: BadgerDB Get-phase read timing accumulators. A badger Get is two
+// distinct phases: txn.Get (LSM lookup — memtable + SST levels, bloom, block
+// reads) and item.ValueCopy (vlog read for kv-separated values, or an inline
+// memcpy when the value lives in the LSM). The badger wrapper times each phase
+// and accumulates here so a benchmark can snapshot before/after a window and
+// subtract to attribute wall-clock read time to LSM vs vlog.
+var (
+	badgerLSMReadNanos  int64
+	badgerVlogReadNanos int64
+	badgerLSMReadCount  int64
+	badgerVlogReadCount int64
+)
+
+// AddBadgerLSMReadNanos records one LSM-lookup phase (txn.Get) duration.
+func AddBadgerLSMReadNanos(ns int64) {
+	atomic.AddInt64(&badgerLSMReadNanos, ns)
+	atomic.AddInt64(&badgerLSMReadCount, 1)
+}
+
+// AddBadgerVlogReadNanos records one value-materialize phase (item.ValueCopy)
+// duration. For kv-separated values this is the vlog read; otherwise it is an
+// inline memcpy and will be near-zero.
+func AddBadgerVlogReadNanos(ns int64) {
+	atomic.AddInt64(&badgerVlogReadNanos, ns)
+	atomic.AddInt64(&badgerVlogReadCount, 1)
+}
+
+// SnapshotBadgerReadTiming returns the cumulative Get-phase timing counters.
+// Snapshot before and after a measurement window and subtract to get the delta.
+func SnapshotBadgerReadTiming() map[string]int64 {
+	return map[string]int64{
+		"lsm_read_time_ns":  atomic.LoadInt64(&badgerLSMReadNanos),
+		"vlog_read_time_ns": atomic.LoadInt64(&badgerVlogReadNanos),
+		"lsm_read_count":    atomic.LoadInt64(&badgerLSMReadCount),
+		"vlog_read_count":   atomic.LoadInt64(&badgerVlogReadCount),
+	}
+}
+
+// CASTLE: DumpBadgerMetricsTo writes all BadgerDB expvar metrics to the given
+// path as CSV, grouped by category with section-header rows
+// (# === CATEGORY ===) between groups. Metrics within each group are sorted
+// alphabetically. Returns the resolved path written.
+func DumpBadgerMetricsTo(path string) (string, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	fmt.Fprintln(f, "metric,value")
+
+	grouped := make(map[string][]string)
+	values := make(map[string]string)
+	expvar.Do(func(kv expvar.KeyValue) {
+		if !strings.HasPrefix(kv.Key, "badger_") {
+			return
+		}
+		cat := badgerMetricCategory(kv.Key)
+		grouped[cat] = append(grouped[cat], kv.Key)
+		values[kv.Key] = kv.Value.String()
+	})
+
+	emitOrder := []string{"read", "write", "compaction", "size", "iterator", "bloom_filter", "memtable", "other"}
+	for _, cat := range emitOrder {
+		keys := grouped[cat]
+		if len(keys) == 0 {
+			continue
+		}
+		sort.Strings(keys)
+		fmt.Fprintf(f, "# === %s ===\n", strings.ToUpper(cat))
+		for _, k := range keys {
+			fmt.Fprintf(f, "%s,%s\n", k, values[k])
+		}
+	}
+	return path, nil
+}
+
+// dumpBadgerMetrics is the legacy auto-path entry used by CloseGlobalLog.
+func dumpBadgerMetrics() {
+	fileName := fmt.Sprintf("./badger_metrics_%d_%d_%s.csv",
+		targetStartBlockNumber, targetEndBlockNumber,
+		time.Now().Format("2006-01-02-15-04-05"))
+	written, err := DumpBadgerMetricsTo(fileName)
+	if err != nil {
+		fmt.Println("Error creating badger metrics file:", err)
+		return
+	}
+	fmt.Println("BadgerDB metrics dumped to:", written)
+}
+
 func CloseGlobalLog() {
+	// CASTLE: Dump BadgerDB expvar metrics before closing
+	dumpBadgerMetrics()
+
 	// CASTLE: Write TOTAL rows (one per op) and close trie stats CSV
 	if trieStatsFile != nil {
 		for op := 0; op < TrieOpCount; op++ {

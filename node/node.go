@@ -714,6 +714,9 @@ func (n *Node) OpenDatabaseWithOptions(name string, opt DatabaseOptions) (ethdb.
 		})
 	} else {
 		opt.AncientsDirectory = n.ResolveAncient(name, opt.AncientsDirectory)
+		if n.config.BadgerValueThreshold != 0 && opt.BadgerValueThreshold == 0 {
+			opt.BadgerValueThreshold = n.config.BadgerValueThreshold
+		}
 		db, err = openDatabase(internalOpenOptions{
 			directory:       n.ResolvePath(name),
 			dbEngine:        n.config.DBEngine,
